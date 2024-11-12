@@ -1,8 +1,10 @@
+// client.c
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <arpa/inet.h>
+#include <sys/select.h>
 
 #define BUFFER_SIZE 1024
 
@@ -17,140 +19,138 @@ int main(int argc, char *argv[])
     char *server_ip = argv[1];
     int server_port = atoi(argv[2]);
 
-    // create socket
+    // 建立 socket
     int sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sockfd < 0)
     {
-        perror("socket");
+        perror("Socket creation failed");
         return 1;
     }
 
-    // set server address
+    // 設定 server 地址
     struct sockaddr_in server_addr;
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(server_port);
     if (inet_pton(AF_INET, server_ip, &server_addr.sin_addr) <= 0)
     {
-        perror("inet_pton");
+        perror("Invalid address/ Address not supported");
+        close(sockfd);
         return 1;
     }
 
-    // connect to server
+    // 連接到 server
     if (connect(sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0)
     {
-        perror("connect");
+        perror("Connection Failed");
+        close(sockfd);
         return 1;
     }
 
-    printf("Connected to server %s:%d\n", server_ip, server_port);
+    // 不顯示任何額外訊息
+    // printf("Connected to server %s:%d\n", server_ip, server_port);
+    // printf("Type your messages below. Type 'Exit' to quit.\n");
 
-    // menu while loop
+    // 使用 select 來同時監聽 stdin 和 socket
     while (1)
     {
-        printf("\n=== Main Menu ===\n");
-        printf("1. Register\n");
-        printf("2. Login\n");
-        printf("3. Exit\n");
-        printf("Choose an option: ");
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+        FD_SET(STDIN_FILENO, &read_fds); // 標準輸入
+        FD_SET(sockfd, &read_fds);       // socket
 
-        int choice;
-        scanf("%d", &choice);
-        getchar(); // clear change line
+        int max_fd = sockfd > STDIN_FILENO ? sockfd : STDIN_FILENO;
 
-        if (choice == 1)
+        // 等待其中一個文件描述符有可讀事件
+        int activity = select(max_fd + 1, &read_fds, NULL, NULL, NULL);
+
+        if (activity < 0)
         {
-            // register function
-            char username[50];
-            printf("Enter username: ");
-            fgets(username, sizeof(username), stdin);
-            username[strcspn(username, "\n")] = 0; // remove change line
-
-            char message[BUFFER_SIZE];
-            snprintf(message, sizeof(message), "REGISTER#%s\r\n", username);
-            send(sockfd, message, strlen(message), 0);
-
-            char buffer[BUFFER_SIZE];
-            int bytes_received = recv(sockfd, buffer, sizeof(buffer) - 1, 0);
-            if (bytes_received > 0)
-            {
-                buffer[bytes_received] = '\0';
-                if (strncmp(buffer, "100 OK", 6) == 0)
-                {
-                    printf("Registration successful.\n");
-                }
-                else if (strncmp(buffer, "210 FAIL", 7) == 0)
-                {
-                    printf("Registration failed.\n");
-                }
-                else
-                {
-                    printf("Unknown response: %s\n", buffer);
-                }
-            }
-        }
-        else if (choice == 2)
-        {
-            // login function
-            char username[50];
-            int portNum;
-            printf("Enter username: ");
-            fgets(username, sizeof(username), stdin);
-            username[strcspn(username, "\n")] = 0; // remove change line
-
-            printf("Enter port number: ");
-            scanf("%d", &portNum);
-            getchar(); // clear change line
-
-            char message[BUFFER_SIZE];
-            snprintf(message, sizeof(message), "%s#%d\r\n", username, portNum);
-            send(sockfd, message, strlen(message), 0);
-
-            char buffer[BUFFER_SIZE];
-            int bytes_received = recv(sockfd, buffer, sizeof(buffer) - 1, 0);
-            if (bytes_received > 0)
-            {
-                buffer[bytes_received] = '\0';
-                if (strncmp(buffer, "220 AUTH_FAIL", 13) == 0)
-                {
-                    printf("Authentication failed.\n");
-                }
-                else
-                {
-                    // login success，show account remainder、online list etc.
-                    printf("Login successful. Server response:\n%s\n", buffer);
-                    // other processing
-                }
-            }
-        }
-        else if (choice == 3)
-        {
-            // offline function
-            char exit_msg[] = "Exit\r\n";
-            send(sockfd, exit_msg, strlen(exit_msg), 0);
-
-            char buffer[BUFFER_SIZE];
-            int bytes_received = recv(sockfd, buffer, sizeof(buffer) - 1, 0);
-            if (bytes_received > 0)
-            {
-                buffer[bytes_received] = '\0';
-                if (strncmp(buffer, "Bye", 3) == 0)
-                {
-                    printf("Successfully exited.\n");
-                }
-                else
-                {
-                    printf("Unknown response: %s\n", buffer);
-                }
-            }
+            perror("select error");
             break;
         }
-        else
+
+        // 檢查是否有來自標準輸入的訊息
+        if (FD_ISSET(STDIN_FILENO, &read_fds))
         {
-            printf("Invalid option. Please try again.\n");
+            // 留出1個字元給 null terminator
+            char input[BUFFER_SIZE - 1];
+            if (fgets(input, sizeof(input), stdin) == NULL)
+            {
+                // EOF 或錯誤
+                break;
+            }
+
+            // 移除換行符
+            input[strcspn(input, "\n")] = 0;
+
+            // 檢查是否退出
+            if (strcmp(input, "Exit") == 0)
+            {
+                // 發送 "Exit" 給 Server
+                ssize_t bytes_sent = send(sockfd, input, strlen(input), 0);
+                if (bytes_sent < 0)
+                {
+                    perror("Send failed");
+                }
+                // 等待接收 "Bye" 後關閉
+                break;
+            }
+
+            // 準備訊息，不加上 <CRLF>
+            char message[BUFFER_SIZE];
+            // 使用 snprintf 並確保不會超過 buffer 大小
+            int ret = snprintf(message, sizeof(message), "%s", input);
+            if (ret < 0)
+            {
+                perror("snprintf error");
+                break;
+            }
+            else if (ret >= sizeof(message))
+            {
+                // 訊息被截斷
+                // 這裡根據需要可以選擇繼續或中斷
+                // 目前選擇繼續
+            }
+
+            // 發送訊息到 server
+            ssize_t bytes_sent = send(sockfd, message, strlen(message), 0);
+            if (bytes_sent < 0)
+            {
+                perror("Send failed");
+                break;
+            }
+        }
+
+        // 檢查是否有來自 socket 的訊息
+        if (FD_ISSET(sockfd, &read_fds))
+        {
+            char buffer[BUFFER_SIZE];
+            ssize_t bytes_received = recv(sockfd, buffer, sizeof(buffer) - 1, 0);
+            if (bytes_received < 0)
+            {
+                perror("Receive failed");
+                break;
+            }
+            else if (bytes_received == 0)
+            {
+                // 伺服器關閉連接
+                // printf("Server closed the connection.\n");
+                break;
+            }
+
+            buffer[bytes_received] = '\0';
+            printf("%s\n", buffer);
+
+            // 如果收到 "Bye"，則退出循環
+            if (strcmp(buffer, "Bye") == 0 || strcmp(buffer, "Bye\r\n") == 0)
+            {
+                break;
+            }
         }
     }
 
+    // 關閉 socket
     close(sockfd);
     return 0;
 }

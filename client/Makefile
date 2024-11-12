@@ -1,18 +1,24 @@
-# Makefile
+# Makefile for Client Program
 
+# 變數定義
 CC = gcc
 CFLAGS = -Wall -g
 TARGET = client
-SRCS = client.c
-OBJS = $(SRCS:.c=.o)
+SRC = client.c
 
+# 預設目標
 all: $(TARGET)
 
-$(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) -o $(TARGET) $(OBJS)
+# 編譯目標
+$(TARGET): $(SRC)
+	$(CC) $(CFLAGS) -o $(TARGET) $(SRC)
 
-%.o: %.c
-	$(CC) $(CFLAGS) -c $< -o $@
-
+# 清除編譯產生的檔案
 clean:
-	rm -f $(TARGET) $(OBJS)
+	rm -f $(TARGET) *.o
+
+# 重新編譯
+rebuild: clean all
+
+# .PHONY 標記非檔案目標
+.PHONY: all clean rebuild
