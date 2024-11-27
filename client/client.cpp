@@ -1,5 +1,3 @@
-// client.cpp
-
 // C 庫
 #include <stdio.h>
 #include <arpa/inet.h>
@@ -257,12 +255,7 @@ public:
 
         std::cout << "Payment of " << amount << " to " << payee_username << " sent successfully." << std::endl;
 
-        // 讀取服務器的響應
-        std::string response = receive_message();
-        if (!response.empty()) {
-            std::cout << "Server response: " << response << std::endl;
-        }
-
+        // 關閉連接
         close(payment_fd);
         return true;
     }
@@ -454,6 +447,12 @@ private:
                 // 將支付消息轉發給服務器
                 if (send_message(payment_message) < 0) {
                     std::cerr << "Failed to forward payment to server." << std::endl;
+                } else {
+                    // 立即讀取服務器的回應，保持通信同步
+                    std::string server_response = receive_message();
+                    if (!server_response.empty()) {
+                        std::cout << "Server response: " << server_response << std::endl;
+                    }
                 }
             }
 
