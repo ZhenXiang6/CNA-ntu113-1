@@ -1,4 +1,4 @@
-# Makefile
+# Makefile for Server Program
 
 # 編譯器
 CXX = g++
@@ -6,8 +6,8 @@ CXX = g++
 # 編譯選項
 CXXFLAGS = -Wall -Wextra -std=c++11 -g
 
-# 連結選項
-LDFLAGS = -pthread
+# 需要鏈接的庫
+LIBS = -lssl -lcrypto -lpthread
 
 # 目標檔案名稱
 TARGET = server
@@ -19,8 +19,11 @@ SRC = server.cpp
 all: $(TARGET)
 
 $(TARGET): $(SRC)
-	$(CXX) $(CXXFLAGS) -o $(TARGET) $(SRC) $(LDFLAGS)
+	$(CXX) $(CXXFLAGS) -o $(TARGET) $(SRC) $(LIBS)
 
 # 清理編譯產物
 clean:
 	rm -f $(TARGET)
+
+# 聲明偽目標
+.PHONY: all clean

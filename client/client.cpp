@@ -1,3 +1,5 @@
+// client.cpp
+
 // C 庫
 #include <stdio.h>
 #include <arpa/inet.h>
@@ -14,7 +16,11 @@
 #include <vector>
 #include <string>
 
-#define BUFFER_SIZE 1024
+// OpenSSL 庫
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+
+#define BUFFER_SIZE 4096
 
 // 用於存儲在線用戶信息的結構體
 struct ActiveUser {
@@ -32,16 +38,30 @@ Client* global_client_ptr = nullptr;
 // Client 類，封裝客戶端功能
 class Client {
 public:
-    Client() : server_socket(-1), p2p_socket(-1), is_running(true), p2p_port_number(0) {
+    Client() : server_socket(-1), p2p_socket(-1), is_running(true), p2p_port_number(0), ssl_ctx(nullptr), ssl(nullptr) {
         // 初始化互斥鎖
         if (pthread_mutex_init(&mutex, nullptr) != 0) {
             perror("Mutex initialization failed");
             exit(EXIT_FAILURE);
         }
+
+        // 初始化 OpenSSL
+        SSL_library_init();
+        SSL_load_error_strings();
+        OpenSSL_add_all_algorithms();
     }
 
     ~Client() {
         // 關閉 socket
+        if (ssl) {
+            SSL_shutdown(ssl);
+            SSL_free(ssl);
+            ssl = nullptr;
+        }
+        if (ssl_ctx) {
+            SSL_CTX_free(ssl_ctx);
+            ssl_ctx = nullptr;
+        }
         if (server_socket != -1) close(server_socket);
         if (p2p_socket != -1) close(p2p_socket);
 
@@ -86,7 +106,53 @@ public:
             return false;
         }
 
-        std::cout << "Successfully connected to socket server at " << host << ":" << port << std::endl;
+        // 創建 SSL_CTX
+        const SSL_METHOD* method = TLS_client_method();
+        ssl_ctx = SSL_CTX_new(method);
+        if (ssl_ctx == NULL) {
+            ERR_print_errors_fp(stderr);
+            close(server_socket);
+            server_socket = -1;
+            return false;
+        }
+
+        // 載入受信任的 CA 憑證（此處假設 server.crt 是自簽名且被信任）
+        if (SSL_CTX_load_verify_locations(ssl_ctx, "server.crt", NULL) <= 0) {
+            ERR_print_errors_fp(stderr);
+            SSL_CTX_free(ssl_ctx);
+            ssl_ctx = nullptr;
+            close(server_socket);
+            server_socket = -1;
+            return false;
+        }
+
+        // 創建 SSL 物件
+        ssl = SSL_new(ssl_ctx);
+        if (ssl == NULL) {
+            ERR_print_errors_fp(stderr);
+            SSL_CTX_free(ssl_ctx);
+            ssl_ctx = nullptr;
+            close(server_socket);
+            server_socket = -1;
+            return false;
+        }
+
+        // 設定 SSL 連線
+        SSL_set_fd(ssl, server_socket);
+
+        // 開始 SSL 握手
+        if (SSL_connect(ssl) <= 0) {
+            ERR_print_errors_fp(stderr);
+            SSL_free(ssl);
+            ssl = nullptr;
+            SSL_CTX_free(ssl_ctx);
+            ssl_ctx = nullptr;
+            close(server_socket);
+            server_socket = -1;
+            return false;
+        }
+
+        std::cout << "SSL connection established with server." << std::endl;
         return true;
     }
 
@@ -265,6 +331,15 @@ public:
         if (is_running) {
             std::string message = "Exit";
             send_message(message);
+            if (ssl) {
+                SSL_shutdown(ssl);
+                SSL_free(ssl);
+                ssl = nullptr;
+            }
+            if (ssl_ctx) {
+                SSL_CTX_free(ssl_ctx);
+                ssl_ctx = nullptr;
+            }
             if (server_socket != -1) {
                 close(server_socket);
                 server_socket = -1;
@@ -357,6 +432,9 @@ private:
     std::string username;        // 用戶名
     std::vector<ActiveUser> active_users; // 在線用戶列表
     int p2p_port_number;         // P2P 監聽端口號
+
+    SSL_CTX* ssl_ctx;            // SSL Context
+    SSL* ssl;                    // SSL 連線
 
     // 靜態信號處理器，調用對應的 terminate 方法
     static void signal_handler(int signum) {
@@ -465,20 +543,12 @@ private:
     // 發送消息到服務器，並確保線程安全
     int send_message(const std::string& message) {
         pthread_mutex_lock(&mutex);
-        ssize_t total_sent = 0;
-        ssize_t to_send = message.length();
-        const char* msg = message.c_str();
-
-        while (total_sent < to_send) {
-            ssize_t sent = send(server_socket, msg + total_sent, to_send - total_sent, 0);
-            if (sent < 0) {
-                perror("Failed to send message");
-                pthread_mutex_unlock(&mutex);
-                return -1;
-            }
-            total_sent += sent;
-        }
+        int ret = SSL_write(ssl, message.c_str(), (int)message.size());
         pthread_mutex_unlock(&mutex);
+        if (ret <= 0) {
+            ERR_print_errors_fp(stderr);
+            return -1;
+        }
         return 0;
     }
 
@@ -487,11 +557,11 @@ private:
         pthread_mutex_lock(&mutex);
         char buffer[BUFFER_SIZE];
         memset(buffer, 0, BUFFER_SIZE);
-        ssize_t bytes_received = recv(server_socket, buffer, BUFFER_SIZE - 1, 0);
+        int bytes_received = SSL_read(ssl, buffer, BUFFER_SIZE - 1);
         pthread_mutex_unlock(&mutex);
 
         if (bytes_received < 0) {
-            perror("Failed to receive message from server");
+            ERR_print_errors_fp(stderr);
             return "";
         }
         else if (bytes_received == 0) {
