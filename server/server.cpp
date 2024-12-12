@@ -21,12 +21,12 @@
 // OpenSSL 庫
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <openssl/pem.h>
 
 #define WORKER_COUNT 64
 #define WORKER_IDLE 0
 #define WORKER_WORKING 1
 #define BUFFER_SIZE 4096
-#define SERVER_PUBLIC_KEY "INFORMATION_MANAGEMENT"
 
 struct User {
     std::string name;
@@ -63,6 +63,7 @@ private:
     static void* handle_client(void* arg);
     int find_idle_worker();
     void close_worker(int index);
+    std::string get_server_public_key_pem();
 };
 
 // 全局指針，用於信號處理
@@ -70,6 +71,8 @@ Server* global_server_ptr = nullptr;
 
 // Constructor
 Server::Server(int port) : hosting_port(port), addrlen(sizeof(address)), ssl_ctx(nullptr) {
+    // 忽略 SIGPIPE 信號
+    signal(SIGPIPE, SIG_IGN);
     // 初始化工作者狀態為閒置
     std::fill_n(worker_status, WORKER_COUNT, WORKER_IDLE);
     std::fill_n(worker_sockets, WORKER_COUNT, -1);
@@ -182,15 +185,74 @@ void Server::signal_handler(int signum) {
     }
 }
 
+// 從 server.crt 中提取公鑰
+std::string Server::get_server_public_key_pem() {
+    FILE* cert_file = fopen("server.crt", "r");
+    if (!cert_file) {
+        std::cerr << "Failed to open server.crt" << std::endl;
+        return "";
+    }
+
+    X509* cert = PEM_read_X509(cert_file, NULL, NULL, NULL);
+    fclose(cert_file);
+    if (!cert) {
+        std::cerr << "Failed to read X509 certificate from server.crt" << std::endl;
+        return "";
+    }
+
+    EVP_PKEY* pkey = X509_get_pubkey(cert);
+    if (!pkey) {
+        std::cerr << "Failed to get public key from certificate." << std::endl;
+        X509_free(cert);
+        return "";
+    }
+
+    BIO* bio = BIO_new(BIO_s_mem());
+    if (!bio) {
+        std::cerr << "Failed to create BIO." << std::endl;
+        EVP_PKEY_free(pkey);
+        X509_free(cert);
+        return "";
+    }
+
+    if (!PEM_write_bio_PUBKEY(bio, pkey)) {
+        std::cerr << "Failed to write public key to BIO." << std::endl;
+        EVP_PKEY_free(pkey);
+        X509_free(cert);
+        BIO_free(bio);
+        return "";
+    }
+
+    char* pem_pkey;
+    long pem_pkey_len = BIO_get_mem_data(bio, &pem_pkey);
+    std::string public_key_str(pem_pkey, pem_pkey_len);
+
+    EVP_PKEY_free(pkey);
+    X509_free(cert);
+    BIO_free(bio);
+
+    // 將公鑰中的換行符號移除，確保公鑰為單行
+    public_key_str.erase(std::remove(public_key_str.begin(), public_key_str.end(), '\n'), public_key_str.end());
+    public_key_str.erase(std::remove(public_key_str.begin(), public_key_str.end(), '\r'), public_key_str.end());
+
+    return public_key_str;
+}
+
 // 生成在線用戶列表和伺服器信息
 std::string Server::generate_list(int user_index) {
-    if (user_index < 0 || user_index >= users.size() || !users[user_index].logged_in) {
+    if (user_index < 0 || user_index >= (int)users.size() || !users[user_index].logged_in) {
         return "500 Internal Error\r\n";
     }
 
     std::stringstream ss;
-    ss << users[user_index].balance << "\n";
-    ss << SERVER_PUBLIC_KEY << "\n";
+    // 使用 \r\n 作為行結尾
+    ss << users[user_index].balance << "\r\n";
+
+    std::string server_public_key = get_server_public_key_pem();
+    if (server_public_key.empty()) {
+        return "500 Internal Error\r\n";
+    }
+    ss << server_public_key << "\r\n";
 
     std::vector<User> online_users;
     for (const auto& user : users) {
@@ -199,7 +261,7 @@ std::string Server::generate_list(int user_index) {
         }
     }
 
-    ss << online_users.size() << "\n";
+    ss << online_users.size() << "\r\n";
     for (const auto& user : online_users) {
         ss << user.name << '#' << user.hostname << '#' << user.p2p_port << "\r\n";
     }
@@ -208,11 +270,11 @@ std::string Server::generate_list(int user_index) {
 }
 
 // 靜態成員函數處理客戶端連接
+// handle_client 函數
 void* Server::handle_client(void* arg) {
     int worker_index = *((int*)arg);
     free(arg);
 
-    // 獲取伺服器實例
     Server* server = global_server_ptr;
 
     SSL* ssl = server->worker_ssls[worker_index];
@@ -227,7 +289,6 @@ void* Server::handle_client(void* arg) {
     struct sockaddr_in client_addr;
     socklen_t client_len = sizeof(client_addr);
 
-    // 獲取客戶端地址信息
     if (getpeername(client_socket, (struct sockaddr*)&client_addr, &client_len) == -1) {
         perror("getpeername failed");
         server->close_worker(worker_index);
@@ -246,13 +307,16 @@ void* Server::handle_client(void* arg) {
         memset(buffer, 0, BUFFER_SIZE);
         int message_len = SSL_read(ssl, buffer, BUFFER_SIZE - 1);
         if (message_len <= 0) {
-            std::cout << "Worker " << worker_index << " client disconnected." << std::endl;
+            int err = SSL_get_error(ssl, message_len);
+            if (err == SSL_ERROR_ZERO_RETURN) {
+                std::cout << "Worker " << worker_index << " client disconnected gracefully." << std::endl;
+            } else {
+                std::cerr << "SSL_read failed with error code: " << err << std::endl;
+            }
             break;
         }
 
         std::string clean_message(buffer, message_len);
-
-        // 移除換行符號
         clean_message.erase(std::remove(clean_message.begin(), clean_message.end(), '\n'), clean_message.end());
         clean_message.erase(std::remove(clean_message.begin(), clean_message.end(), '\r'), clean_message.end());
 
@@ -266,7 +330,12 @@ void* Server::handle_client(void* arg) {
                 std::lock_guard<std::mutex> lock(server->user_mutex);
                 server->users[login_status].logged_in = false;
             }
-            SSL_write(ssl, return_message.c_str(), return_message.length());
+
+            int write_ret = SSL_write(ssl, return_message.c_str(), (int)return_message.length());
+            if (write_ret <= 0) {
+                int err = SSL_get_error(ssl, write_ret);
+                std::cerr << "SSL_write failed with error code: " << err << std::endl;
+            }
             break;
         }
         else if (clean_message == "List") {
@@ -316,7 +385,20 @@ void* Server::handle_client(void* arg) {
                 return_message = "250 Forbidden\r\n";
             }
             else {
-                int amount = std::stoi(amount_str);
+                int amount;
+                try {
+                    amount = std::stoi(amount_str);
+                }
+                catch (...) {
+                    return_message = "240 Format Error\r\n";
+                    int write_ret = SSL_write(ssl, return_message.c_str(), (int)return_message.length());
+                    if (write_ret <= 0) {
+                        int err = SSL_get_error(ssl, write_ret);
+                        std::cerr << "SSL_write failed with error code: " << err << std::endl;
+                    }
+                    continue;
+                }
+
                 bool transaction_success = false;
 
                 {
@@ -350,7 +432,20 @@ void* Server::handle_client(void* arg) {
             std::getline(ss, username, '#');
             std::getline(ss, port_string, '#');
 
-            int port = std::stoi(port_string);
+            int port;
+            try {
+                port = std::stoi(port_string);
+            }
+            catch (...) {
+                return_message = "240 Format Error\r\n";
+                int write_ret = SSL_write(ssl, return_message.c_str(), (int)return_message.length());
+                if (write_ret <= 0) {
+                    int err = SSL_get_error(ssl, write_ret);
+                    std::cerr << "SSL_write failed with error code: " << err << std::endl;
+                }
+                continue;
+            }
+
             bool valid_user = false;
 
             {
@@ -377,7 +472,13 @@ void* Server::handle_client(void* arg) {
             return_message = "240 Format Error\r\n";
         }
 
-        SSL_write(ssl, return_message.c_str(), return_message.length());
+        // 發送回應消息並檢查錯誤
+        int write_ret = SSL_write(ssl, return_message.c_str(), (int)return_message.length());
+        if (write_ret <= 0) {
+            int err = SSL_get_error(ssl, write_ret);
+            std::cerr << "SSL_write failed with error code: " << err << std::endl;
+            break; // 退出循環，關閉該客戶端連接
+        }
     }
 
     std::cout << "Worker " << worker_index << " terminating." << std::endl;

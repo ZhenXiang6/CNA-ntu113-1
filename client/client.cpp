@@ -15,6 +15,7 @@
 #include <sstream>
 #include <vector>
 #include <string>
+#include <algorithm> // 用於 std::remove
 
 // OpenSSL 庫
 #include <openssl/ssl.h>
@@ -52,7 +53,7 @@ public:
     }
 
     ~Client() {
-        // 關閉 socket
+        // 關閉 SSL 連線和 socket
         if (ssl) {
             SSL_shutdown(ssl);
             SSL_free(ssl);
@@ -165,11 +166,14 @@ public:
         }
 
         std::string response = receive_message();
-        if (response == "100 OK\n" || response == "100 OK\r\n") {
+        // 移除可能存在的 '\n' 和 '\r'
+        trim_response(response);
+
+        if (response == "100 OK") {
             std::cout << "Registration successful." << std::endl;
             return true;
         }
-        else if (response == "210 FAIL\n" || response == "210 FAIL\r\n") {
+        else if (response == "210 FAIL") {
             std::cout << "Registration failed: User already exists." << std::endl;
             return false;
         }
@@ -190,7 +194,10 @@ public:
         }
 
         std::string response = receive_message();
-        if (response == "220 AUTH_FAIL\n" || response == "220 AUTH_FAIL\r\n") {
+        // 移除可能存在的 '\n' 和 '\r'
+        trim_response(response);
+
+        if (response == "220 AUTH_FAIL") {
             std::cout << "Login failed: User does not exist on the designated server." << std::endl;
             return false;
         }
@@ -220,26 +227,55 @@ public:
             return false;
         }
 
-        // 解析服務器響應：<accountBalance><CRLF><serverPublicKey><CRLF><number of accounts online><CRLF><user1>#<ip>#<port><CRLF>...
+        // 檢查是否收到錯誤訊息
+        if (response.find("500 Internal Error") != std::string::npos) {
+            std::cerr << "Server encountered an internal error while processing the List request." << std::endl;
+            return false;
+        }
+
+        // 解析服務器響應：<accountBalance>\r\n<serverPublicKey>\r\n<number of active users>\r\n<user1>#<ip>#<port>\r\n...
         std::stringstream ss(response);
         std::string line;
         if (!std::getline(ss, line)) {
             std::cerr << "Failed to parse account balance." << std::endl;
             return false;
         }
-        int account_balance = std::stoi(line);
+
+        // 移除可能存在的 '\r'
+        trim_response(line);
+
+        int account_balance;
+        try {
+            account_balance = std::stoi(line);
+        }
+        catch (std::invalid_argument&) {
+            std::cerr << "Invalid account balance format: " << line << std::endl;
+            return false;
+        }
 
         if (!std::getline(ss, line)) {
             std::cerr << "Failed to parse server public key." << std::endl;
             return false;
         }
+        // 移除可能存在的 '\r'
+        trim_response(line);
         std::string server_public_key = line;
 
         if (!std::getline(ss, line)) {
             std::cerr << "Failed to parse number of active users." << std::endl;
             return false;
         }
-        int num_active_users = std::stoi(line);
+        // 移除可能存在的 '\r'
+        trim_response(line);
+
+        int num_active_users;
+        try {
+            num_active_users = std::stoi(line);
+        }
+        catch (std::invalid_argument&) {
+            std::cerr << "Invalid number of active users format: " << line << std::endl;
+            return false;
+        }
 
         active_users.clear();
         for (int i = 0; i < num_active_users; ++i) {
@@ -247,6 +283,9 @@ public:
                 std::cerr << "Failed to parse active user info." << std::endl;
                 break;
             }
+            // 移除可能存在的 '\r'
+            trim_response(line);
+
             size_t pos1 = line.find('#');
             size_t pos2 = line.find('#', pos1 + 1);
             if (pos1 == std::string::npos || pos2 == std::string::npos) {
@@ -255,7 +294,14 @@ public:
             }
             std::string uname = line.substr(0, pos1);
             std::string uhost = line.substr(pos1 + 1, pos2 - pos1 - 1);
-            int uport = std::stoi(line.substr(pos2 + 1));
+            int uport;
+            try {
+                uport = std::stoi(line.substr(pos2 + 1));
+            }
+            catch (std::invalid_argument&) {
+                std::cerr << "Invalid user port format: " << line.substr(pos2 + 1) << std::endl;
+                continue;
+            }
 
             active_users.push_back({ uname, uhost, uport });
         }
@@ -329,7 +375,7 @@ public:
     // 終止連接
     void terminate() {
         if (is_running) {
-            std::string message = "Exit";
+            std::string message = "Exit\r\n"; // 修改為 \r\n
             send_message(message);
             if (ssl) {
                 SSL_shutdown(ssl);
@@ -571,6 +617,20 @@ private:
         }
 
         return std::string(buffer, bytes_received);
+    }
+
+    // 移除字串中的 '\r' 和 '\n' 字符
+    void trim_response(std::string& str) {
+        // 移除 '\n'
+        size_t pos = str.find('\n');
+        if (pos != std::string::npos) {
+            str.erase(pos);
+        }
+        // 移除 '\r'，如果存在
+        pos = str.find('\r');
+        if (pos != std::string::npos) {
+            str.erase(pos);
+        }
     }
 };
 
